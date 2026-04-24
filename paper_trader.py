@@ -48,6 +48,7 @@ INTERVAL_MIN = 60           # 1시간 주기 (Trade.xyz 정산 주기)
 BN_SETTLE_HOURS = {0, 8, 16}  # Binance 정산 시각 (UTC)
 MIN_XYZ_VOL_24H = 1_000_000   # XYZ 최소 24h 거래량 $1M
 MAX_POS_OI_RATIO = 0.02        # 포지션은 MinOI의 최대 2%
+DEFAULT_LEVERAGE = 5            # 기본 5x 레버리지 (양쪽 delta-neutral)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -93,11 +94,13 @@ class Position:
     ticker: str
     bn_sym: str
     direction: str          # "XYZ_L_BN_S" or "XYZ_S_BN_L"
-    size_usd: float
+    size_usd: float         # 노셔널 (마진 × 레버리지)
     xyz_entry_px: float
     bn_entry_px: float
     entry_time: str
     entry_fees: float
+    margin_used: float = 0.0
+    leverage: int = 5
     funding_pnl: float = 0.0
     xyz_funding_count: int = 0
     bn_funding_count: int = 0
@@ -123,7 +126,7 @@ class PaperAccount:
     total_trades: int = 0
 
     def available_capital(self) -> float:
-        used = sum(p.size_usd for p in self.positions.values())
+        used = sum(p.margin_used for p in self.positions.values())
         return self.capital - used
 
     def save(self):
@@ -239,11 +242,12 @@ def calc_entry_cost(size: float, opp: dict) -> float:
     return size * (XYZ_TAKER_FEE + BN_TAKER_FEE + xyz_slip + bn_slip + xyz_ba_half + bn_ba_half)
 
 
-def calc_position_size(capital_available: float, pct: float, min_oi_usd: float) -> float:
-    """유동성 비례 사이징: 자본 기준 + OI 상한 중 작은 값"""
-    from_capital = capital_available * pct
-    from_oi = min_oi_usd * MAX_POS_OI_RATIO
-    return min(from_capital, from_oi, 5000)
+def calc_position_size(capital_available: float, pct: float, min_oi_usd: float, leverage: int = DEFAULT_LEVERAGE) -> float:
+    """유동성 비례 사이징: 마진 기준 → 노셔널 = 마진 × 레버리지, OI 상한 적용"""
+    margin = capital_available * pct
+    notional = margin * leverage
+    oi_cap = min_oi_usd * MAX_POS_OI_RATIO
+    return min(notional, oi_cap, 25000)  # 노셔널 상한 $25K
 
 
 def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> list:
@@ -309,14 +313,17 @@ def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> lis
     return opps
 
 
-def open_position(acct: PaperAccount, opp: dict, size_usd: float) -> Position:
+def open_position(acct: PaperAccount, opp: dict, size_usd: float, leverage: int = DEFAULT_LEVERAGE) -> Position:
     total_entry_cost = calc_entry_cost(size_usd, opp)
+    margin = size_usd / leverage
 
     pos = Position(
         ticker=opp["ticker"],
         bn_sym=opp["bn_sym"],
         direction=opp["direction"],
         size_usd=size_usd,
+        margin_used=margin,
+        leverage=leverage,
         xyz_entry_px=opp["xyz_px"],
         bn_entry_px=opp["bn_px"],
         entry_time=datetime.now(timezone.utc).isoformat(),
@@ -546,7 +553,7 @@ def print_status(acct: PaperAccount, mkt: dict):
             rows.append([
                 ticker,
                 dir_short,
-                f"${pos.size_usd:,.0f}",
+                f"${pos.size_usd:,.0f}({pos.leverage}x)",
                 f"{pos.hold_hours():.1f}h",
                 f"{pos.xyz_funding_count}/{pos.bn_funding_count}",
                 f"${pos.funding_pnl:+,.4f}",
@@ -584,9 +591,10 @@ def main():
     args = sys.argv[1:]
     capital = 10000.0
     max_pos = 3
-    min_spread = 0.04       # 0.04%/8h — 수수료+슬리피지 커버 가능한 보수적 기준
+    leverage = DEFAULT_LEVERAGE
+    min_spread = 0.04       # 0.04%/8h
     min_oi = 0.8             # 최소 OI $800K
-    pos_size_pct = 0.20      # 자본의 20%씩
+    pos_size_pct = 0.20      # 마진의 20%씩
 
     i = 0
     while i < len(args):
@@ -594,6 +602,8 @@ def main():
             capital = float(args[i+1]); i += 2
         elif args[i] == "--max-pos" and i+1 < len(args):
             max_pos = int(args[i+1]); i += 2
+        elif args[i] == "--leverage" and i+1 < len(args):
+            leverage = int(args[i+1]); i += 2
         elif args[i] == "--min-spread" and i+1 < len(args):
             min_spread = float(args[i+1]); i += 2
         elif args[i] == "--min-oi" and i+1 < len(args):
@@ -612,9 +622,9 @@ def main():
     iteration = 0
 
     print(f"Tradenance Paper Trader (1h cycle)")
-    print(f"  Capital: ${acct.capital:,.2f} | Max positions: {max_pos}")
+    print(f"  Capital: ${acct.capital:,.2f} | Leverage: {leverage}x | Max positions: {max_pos}")
     print(f"  Min spread: {min_spread}%/8h | Min OI: ${min_oi}M")
-    print(f"  Position size: {pos_size_pct*100:.0f}% of capital | Max $5K/leg")
+    print(f"  Margin per pos: {pos_size_pct*100:.0f}% of avail → notional ×{leverage}")
     print(f"  Fees: XYZ {XYZ_TAKER_FEE*100:.3f}% + BN {BN_TAKER_FEE*100:.3f}% | Slip safety: {SLIPPAGE_SAFETY}x")
 
     while True:
@@ -657,18 +667,19 @@ def main():
             print(f"  [3/4] Opportunities: {len(new_opps)} new / {len(opps)} total")
             print_scan_results(new_opps)
 
-            # 4. 신규 진입 (유동성 비례 사이징)
+            # 4. 신규 진입 (유동성 비례 사이징 + 레버리지)
             slots = max_pos - len(acct.positions)
             entered = 0
             if slots > 0 and new_opps:
                 for opp in new_opps[:slots]:
-                    size = calc_position_size(acct.available_capital(), pos_size_pct, opp["min_oi_usd"])
+                    size = calc_position_size(acct.available_capital(), pos_size_pct, opp["min_oi_usd"], leverage)
                     if size < 100:
                         print(f"  [4/4] Insufficient capital or liquidity (avail=${acct.available_capital():.0f}, minOI=${opp['min_oi_usd']/1e6:.1f}M)")
                         break
-                    pos = open_position(acct, opp, size)
+                    pos = open_position(acct, opp, size, leverage)
                     dir_short = "L/S" if "L_BN_S" in pos.direction else "S/L"
-                    print(f"  [OPEN] {pos.ticker} | XYZ/BN={dir_short} | ${size:,.0f} | BA={opp['total_ba_pct']:.3f}% | Fees: ${pos.entry_fees:.4f}")
+                    margin = size / leverage
+                    print(f"  [OPEN] {pos.ticker} | XYZ/BN={dir_short} | ${size:,.0f}({leverage}x, margin=${margin:,.0f}) | BA={opp['total_ba_pct']:.3f}% | Fees: ${pos.entry_fees:.4f}")
                     entered += 1
 
             if entered == 0 and slots > 0:
