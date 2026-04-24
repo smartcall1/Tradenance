@@ -94,33 +94,30 @@ def fetch_tradexyz_all() -> dict:
 
 def fetch_binance_all() -> dict:
     result = {}
-    for bn_sym in OVERLAP_PAIRS.values():
-        try:
-            r = requests.get(
-                "https://fapi.binance.com/fapi/v1/premiumIndex",
-                params={"symbol": bn_sym}, timeout=10,
-            )
-            if r.status_code != 200:
-                continue
-            d = r.json()
-            result[bn_sym] = {
+    bn_symbols = set(OVERLAP_PAIRS.values())
+
+    r = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10)
+    r.raise_for_status()
+    for d in r.json():
+        sym = d.get("symbol", "")
+        if sym in bn_symbols:
+            result[sym] = {
                 "funding_8h": _sf(d.get("lastFundingRate")),
                 "mark_px": _sf(d.get("markPrice")),
                 "index_px": _sf(d.get("indexPrice")),
             }
-        except Exception as e:
-            result[bn_sym] = {"error": str(e)}
-        time.sleep(0.08)
 
-    for bn_sym in OVERLAP_PAIRS.values():
+    for bn_sym in bn_symbols:
+        if bn_sym not in result:
+            continue
         try:
             r = requests.get(
                 "https://fapi.binance.com/fapi/v1/openInterest",
                 params={"symbol": bn_sym}, timeout=10,
             )
-            if r.status_code == 200 and bn_sym in result and "error" not in result[bn_sym]:
+            if r.status_code == 200:
                 result[bn_sym]["oi"] = _sf(r.json().get("openInterest"))
-        except:
+        except Exception:
             pass
         time.sleep(0.05)
 
