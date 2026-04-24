@@ -46,6 +46,8 @@ BN_TAKER_FEE = 0.0005      # 0.05%
 SLIPPAGE_SAFETY = 1.5       # 슬리피지 추정 × 1.5 안전계수
 INTERVAL_MIN = 60           # 1시간 주기 (Trade.xyz 정산 주기)
 BN_SETTLE_HOURS = {0, 8, 16}  # Binance 정산 시각 (UTC)
+MIN_XYZ_VOL_24H = 1_000_000   # XYZ 최소 24h 거래량 $1M
+MAX_POS_OI_RATIO = 0.02        # 포지션은 MinOI의 최대 2%
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -157,7 +159,7 @@ class PaperAccount:
 
 
 def fetch_market_data() -> dict:
-    # Trade.xyz — 1회 호출로 전종목
+    # Trade.xyz — 1회 호출로 전종목 (bid/ask 포함)
     resp = requests.post(HL_API, json={"type": "metaAndAssetCtxs", "dex": "xyz"}, timeout=15)
     resp.raise_for_status()
     data = resp.json()
@@ -165,15 +167,24 @@ def fetch_market_data() -> dict:
     for meta, ctx in zip(data[0]["universe"], data[1]):
         name = meta["name"].replace("xyz:", "")
         mk = _sf(ctx.get("markPx"))
+        mid = _sf(ctx.get("midPx")) or mk
         oi_qty = _sf(ctx.get("openInterest"))
+        impacts = ctx.get("impactPxs") or []
+        bid = _sf(impacts[0]) if len(impacts) > 0 else mid
+        ask = _sf(impacts[1]) if len(impacts) > 1 else mid
+        ba_spread = (ask - bid) / mid if mid > 0 else 0
         xyz[name] = {
             "funding_1h": _sf(ctx.get("funding")),
             "mark_px": mk,
+            "mid_px": mid,
+            "bid": bid,
+            "ask": ask,
+            "ba_spread": ba_spread,
             "oi_usd": oi_qty * mk if mk else 0,
             "vol_24h": _sf(ctx.get("dayNtlVlm")),
         }
 
-    # Binance — 1회 호출로 전종목 (I1 수정)
+    # Binance — premiumIndex + bookTicker 일괄 조회
     bn = {}
     bn_symbols = set(OVERLAP_PAIRS.values())
 
@@ -189,11 +200,18 @@ def fetch_market_data() -> dict:
                 "next_funding": d.get("nextFundingTime", 0),
             }
 
-    r2 = requests.get("https://fapi.binance.com/fapi/v1/openInterest", timeout=10)
-    if r2.status_code == 200:
-        # openInterest는 개별 호출만 가능, 하지만 ticker 전체 조회가 없으므로 bulk로
-        pass
-    # openInterest는 개별 호출만 지원 — 최소한의 호출
+    r_book = requests.get("https://fapi.binance.com/fapi/v1/ticker/bookTicker", timeout=10)
+    if r_book.status_code == 200:
+        for d in r_book.json():
+            sym = d.get("symbol", "")
+            if sym in bn and sym in bn_symbols:
+                bid = _sf(d.get("bidPrice"))
+                ask = _sf(d.get("askPrice"))
+                mid = (bid + ask) / 2 if bid > 0 and ask > 0 else bn[sym]["mark_px"]
+                bn[sym]["bid"] = bid
+                bn[sym]["ask"] = ask
+                bn[sym]["ba_spread"] = (ask - bid) / mid if mid > 0 else 0
+
     for bn_sym in bn_symbols:
         if bn_sym not in bn:
             continue
@@ -212,8 +230,24 @@ def fetch_market_data() -> dict:
     return {"xyz": xyz, "bn": bn}
 
 
+def calc_entry_cost(size: float, opp: dict) -> float:
+    """진입 시 총 비용: 수수료 + 슬리피지 + 호가스프레드(half, 양쪽)"""
+    xyz_slip = estimate_slippage(size, opp["xyz_oi_usd"])
+    bn_slip = estimate_slippage(size, opp["bn_oi_usd"])
+    xyz_ba_half = opp.get("xyz_ba_spread", 0) / 2
+    bn_ba_half = opp.get("bn_ba_spread", 0) / 2
+    return size * (XYZ_TAKER_FEE + BN_TAKER_FEE + xyz_slip + bn_slip + xyz_ba_half + bn_ba_half)
+
+
+def calc_position_size(capital_available: float, pct: float, min_oi_usd: float) -> float:
+    """유동성 비례 사이징: 자본 기준 + OI 상한 중 작은 값"""
+    from_capital = capital_available * pct
+    from_oi = min_oi_usd * MAX_POS_OI_RATIO
+    return min(from_capital, from_oi, 5000)
+
+
 def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> list:
-    """min_spread_pct: %/8h 단위 (예: 0.03 = 0.03%/8h)"""
+    """min_spread_pct: %/8h 단위 (예: 0.04 = 0.04%/8h)"""
     opps = []
     for ticker, bn_sym in OVERLAP_PAIRS.items():
         x = mkt["xyz"].get(ticker)
@@ -226,7 +260,11 @@ def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> lis
         if xyz_px <= 0 or bn_px <= 0:
             continue
 
-        x8 = x["funding_1h"] * 8  # 8h 환산 (비교 목적)
+        # 거래량 필터
+        if x["vol_24h"] < MIN_XYZ_VOL_24H:
+            continue
+
+        x8 = x["funding_1h"] * 8
         b8 = b["funding_8h"]
         spread = x8 - b8
 
@@ -237,6 +275,14 @@ def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> lis
         if abs(spread) < min_spread_pct / 100:
             continue
         if min_oi < min_oi_m * 1e6:
+            continue
+
+        xyz_ba = x.get("ba_spread", 0)
+        bn_ba = b.get("ba_spread", 0)
+        total_ba = xyz_ba + bn_ba
+
+        # 호가 스프레드가 펀딩 스프레드보다 크면 진입해도 손해
+        if total_ba > abs(spread) * 2:
             continue
 
         opps.append({
@@ -253,6 +299,10 @@ def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> lis
             "xyz_oi_usd": x_oi,
             "bn_oi_usd": b_oi,
             "min_oi_usd": min_oi,
+            "xyz_ba_spread": xyz_ba,
+            "bn_ba_spread": bn_ba,
+            "total_ba_pct": total_ba * 100,
+            "xyz_vol_24h": x["vol_24h"],
         })
 
     opps.sort(key=lambda o: o["abs_spread"], reverse=True)
@@ -260,9 +310,7 @@ def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> lis
 
 
 def open_position(acct: PaperAccount, opp: dict, size_usd: float) -> Position:
-    xyz_slip = estimate_slippage(size_usd, opp["xyz_oi_usd"])
-    bn_slip = estimate_slippage(size_usd, opp["bn_oi_usd"])
-    total_entry_cost = size_usd * (XYZ_TAKER_FEE + BN_TAKER_FEE + xyz_slip + bn_slip)
+    total_entry_cost = calc_entry_cost(size_usd, opp)
 
     pos = Position(
         ticker=opp["ticker"],
@@ -307,7 +355,9 @@ def close_position(acct: PaperAccount, ticker: str, mkt: dict, reason: str) -> f
     b_oi = b.get("oi_usd", 0) if b else 0
     xyz_slip = estimate_slippage(pos.size_usd, x_oi)
     bn_slip = estimate_slippage(pos.size_usd, b_oi)
-    exit_fees = pos.size_usd * (XYZ_TAKER_FEE + BN_TAKER_FEE + xyz_slip + bn_slip)
+    xyz_ba_half = x.get("ba_spread", 0) / 2 if x else 0.001
+    bn_ba_half = b.get("ba_spread", 0) / 2 if b else 0.001
+    exit_fees = pos.size_usd * (XYZ_TAKER_FEE + BN_TAKER_FEE + xyz_slip + bn_slip + xyz_ba_half + bn_ba_half)
 
     # 베이시스 PnL (델타뉴트럴: 양쪽 가격 괴리 변화분)
     if pos.direction == "XYZ_L_BN_S":
@@ -515,20 +565,18 @@ def print_scan_results(opps: list):
         return
     rows = []
     for o in opps[:8]:
-        entry_cost = 2000 * (XYZ_TAKER_FEE + BN_TAKER_FEE +
-                             estimate_slippage(2000, o["xyz_oi_usd"]) +
-                             estimate_slippage(2000, o["bn_oi_usd"]))
-        funding_1h = abs(o["xyz_funding_1h"]) * 2000  # 1시간 수익 추정
+        entry_cost = calc_entry_cost(2000, o)
         rows.append([
             o["ticker"],
             f"{o['spread_8h']*100:+.4f}%",
             f"{o['annual']:+.1f}%",
             "L/S" if "L_BN_S" in o["direction"] else "S/L",
             f"${o['min_oi_usd']/1e6:.1f}M",
+            f"${o['xyz_vol_24h']/1e6:.0f}M",
+            f"{o['total_ba_pct']:.3f}%",
             f"${entry_cost:.2f}",
-            f"${funding_1h:.4f}",
         ])
-    headers = ["Ticker", "Spread/8h", "Annual", "XYZ/BN", "MinOI", "EntryCost$2K", "Fund$/1h"]
+    headers = ["Ticker", "Spread/8h", "Annual", "XYZ/BN", "MinOI", "Vol24h", "BA%", "Cost$2K"]
     print(tabulate(rows, headers=headers, tablefmt="simple_grid", stralign="right"))
 
 
@@ -609,19 +657,18 @@ def main():
             print(f"  [3/4] Opportunities: {len(new_opps)} new / {len(opps)} total")
             print_scan_results(new_opps)
 
-            # 4. 신규 진입 (C3 수정: 매 진입마다 size 재계산)
+            # 4. 신규 진입 (유동성 비례 사이징)
             slots = max_pos - len(acct.positions)
             entered = 0
             if slots > 0 and new_opps:
                 for opp in new_opps[:slots]:
-                    size = acct.available_capital() * pos_size_pct
-                    size = min(size, 5000)
+                    size = calc_position_size(acct.available_capital(), pos_size_pct, opp["min_oi_usd"])
                     if size < 100:
-                        print(f"  [4/4] Insufficient capital (available: ${acct.available_capital():.2f})")
+                        print(f"  [4/4] Insufficient capital or liquidity (avail=${acct.available_capital():.0f}, minOI=${opp['min_oi_usd']/1e6:.1f}M)")
                         break
                     pos = open_position(acct, opp, size)
                     dir_short = "L/S" if "L_BN_S" in pos.direction else "S/L"
-                    print(f"  [OPEN] {pos.ticker} | XYZ/BN={dir_short} | ${size:,.0f} | Fees: ${pos.entry_fees:.4f}")
+                    print(f"  [OPEN] {pos.ticker} | XYZ/BN={dir_short} | ${size:,.0f} | BA={opp['total_ba_pct']:.3f}% | Fees: ${pos.entry_fees:.4f}")
                     entered += 1
 
             if entered == 0 and slots > 0:
