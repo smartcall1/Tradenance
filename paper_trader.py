@@ -617,7 +617,7 @@ def print_scan_results(opps: list):
 def main():
     args = sys.argv[1:]
     capital = 10000.0
-    max_pos = 2
+    max_pos = 3
     leverage = DEFAULT_LEVERAGE
     min_spread = 0.10       # 0.10%/8h (이전 0.04 → 비용 대비 충분한 스프레드만)
     min_oi = 0.8             # 최소 OI $800K
