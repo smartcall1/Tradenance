@@ -43,12 +43,16 @@ OVERLAP_PAIRS = {
 
 XYZ_TAKER_FEE = 0.00009    # 0.009% Growth Mode
 BN_TAKER_FEE = 0.0005      # 0.05%
-SLIPPAGE_SAFETY = 1.5       # 슬리피지 추정 × 1.5 안전계수
+SLIPPAGE_SAFETY = 1.0       # 슬리피지 추정 (보수적 1.5→현실적 1.0)
+LIMIT_ORDER_BA_FACTOR = 0.5 # limit order 사용 가정 → BA 비용 50% 할인
 INTERVAL_MIN = 60           # 1시간 주기 (Trade.xyz 정산 주기)
 BN_SETTLE_HOURS = {0, 8, 16}  # Binance 정산 시각 (UTC)
 MIN_XYZ_VOL_24H = 1_000_000   # XYZ 최소 24h 거래량 $1M
 MAX_POS_OI_RATIO = 0.02        # 포지션은 MinOI의 최대 2%
 DEFAULT_LEVERAGE = 5            # 기본 5x 레버리지 (양쪽 delta-neutral)
+MAX_BA_PCT = 0.0006             # 양쪽 합산 BA > 0.06%면 스킵
+MAX_BREAKEVEN_HOURS = 18        # 손익분기 예상 18시간 초과 시 스킵
+MIN_HOLD_HOURS = 6              # 최소 보유 시간 (SPREAD_COLLAPSED 조기 종료 방지)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -234,11 +238,11 @@ def fetch_market_data() -> dict:
 
 
 def calc_entry_cost(size: float, opp: dict) -> float:
-    """진입 시 총 비용: 수수료 + 슬리피지 + 호가스프레드(half, 양쪽)"""
+    """진입 시 총 비용: 수수료 + 슬리피지 + 호가스프레드(half, limit 할인 적용)"""
     xyz_slip = estimate_slippage(size, opp["xyz_oi_usd"])
     bn_slip = estimate_slippage(size, opp["bn_oi_usd"])
-    xyz_ba_half = opp.get("xyz_ba_spread", 0) / 2
-    bn_ba_half = opp.get("bn_ba_spread", 0) / 2
+    xyz_ba_half = opp.get("xyz_ba_spread", 0) / 2 * LIMIT_ORDER_BA_FACTOR
+    bn_ba_half = opp.get("bn_ba_spread", 0) / 2 * LIMIT_ORDER_BA_FACTOR
     return size * (XYZ_TAKER_FEE + BN_TAKER_FEE + xyz_slip + bn_slip + xyz_ba_half + bn_ba_half)
 
 
@@ -285,8 +289,22 @@ def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> lis
         bn_ba = b.get("ba_spread", 0)
         total_ba = xyz_ba + bn_ba
 
-        # 호가 스프레드가 펀딩 스프레드보다 크면 진입해도 손해
-        if total_ba > abs(spread) * 2:
+        # BA 스프레드 절대 상한 (양쪽 합산)
+        if total_ba > MAX_BA_PCT:
+            continue
+
+        # BA > 펀딩 스프레드면 수수료만 내는 거래
+        if total_ba > abs(spread):
+            continue
+
+        # 손익분기 시간 추정: 왕복 비용 / 시간당 펀딩 수입
+        hourly_funding = abs(spread) / 8 * 2000  # $2K 기준 시간당 수입
+        round_trip_cost = calc_entry_cost(2000, {
+            "xyz_oi_usd": x_oi, "bn_oi_usd": b_oi,
+            "xyz_ba_spread": xyz_ba, "bn_ba_spread": bn_ba,
+        }) * 2  # 진입 + 청산
+        breakeven_h = round_trip_cost / hourly_funding if hourly_funding > 0 else 999
+        if breakeven_h > MAX_BREAKEVEN_HOURS:
             continue
 
         opps.append({
@@ -307,6 +325,7 @@ def scan_opportunities(mkt: dict, min_spread_pct: float, min_oi_m: float) -> lis
             "bn_ba_spread": bn_ba,
             "total_ba_pct": total_ba * 100,
             "xyz_vol_24h": x["vol_24h"],
+            "breakeven_h": breakeven_h,
         })
 
     opps.sort(key=lambda o: o["abs_spread"], reverse=True)
@@ -362,8 +381,8 @@ def close_position(acct: PaperAccount, ticker: str, mkt: dict, reason: str) -> f
     b_oi = b.get("oi_usd", 0) if b else 0
     xyz_slip = estimate_slippage(pos.size_usd, x_oi)
     bn_slip = estimate_slippage(pos.size_usd, b_oi)
-    xyz_ba_half = x.get("ba_spread", 0) / 2 if x else 0.001
-    bn_ba_half = b.get("ba_spread", 0) / 2 if b else 0.001
+    xyz_ba_half = x.get("ba_spread", 0) / 2 * LIMIT_ORDER_BA_FACTOR if x else 0.0005
+    bn_ba_half = b.get("ba_spread", 0) / 2 * LIMIT_ORDER_BA_FACTOR if b else 0.0005
     exit_fees = pos.size_usd * (XYZ_TAKER_FEE + BN_TAKER_FEE + xyz_slip + bn_slip + xyz_ba_half + bn_ba_half)
 
     # 베이시스 PnL (델타뉴트럴: 양쪽 가격 괴리 변화분)
@@ -459,7 +478,6 @@ def should_close(pos: Position, mkt: dict, min_spread_pct: float) -> tuple:
     x = mkt["xyz"].get(pos.ticker)
     b = mkt["bn"].get(pos.bn_sym)
 
-    # I3 수정: 데이터 5회 연속 실패 시 강제 청산
     if pos.data_fail_streak >= 5:
         return True, "DATA_FAIL"
 
@@ -468,20 +486,28 @@ def should_close(pos: Position, mkt: dict, min_spread_pct: float) -> tuple:
 
     x_fr = x.get("funding_1h", 0)
     b_fr = b.get("funding_8h", 0)
-    current_spread = x_fr * 8 - b_fr  # 8h 환산 비교
+    current_spread = x_fr * 8 - b_fr
 
-    # 스프레드 반전
+    # 스프레드 완전 반전 → 즉시 청산 (보유시간 무관)
     if pos.direction == "XYZ_L_BN_S" and current_spread > 0:
         return True, "SPREAD_REVERSED"
     if pos.direction == "XYZ_S_BN_L" and current_spread < 0:
         return True, "SPREAD_REVERSED"
 
-    # 스프레드 축소 (최소 기준의 30% 이하)
-    if abs(current_spread) < min_spread_pct / 100 * 0.3:
+    # 최소 보유시간 미달이면 반전 외에는 보유
+    if pos.hold_hours() < MIN_HOLD_HOURS:
+        return False, ""
+
+    # 스프레드 축소 (최소 기준의 20% 이하, MIN_HOLD 이후만)
+    if abs(current_spread) < min_spread_pct / 100 * 0.2:
         return True, "SPREAD_COLLAPSED"
 
-    # I4 수정: 시간 기반 손절 (24시간 보유 후 순손실이면)
-    if pos.hold_hours() >= 24 and pos.net_pnl() < -pos.entry_fees * 0.5:
+    # 이익 실현: 수수료 2배 이상 벌었으면 확보
+    if pos.net_pnl() > pos.entry_fees * 2:
+        return True, "TAKE_PROFIT"
+
+    # 48시간 보유 후 순손실이면 손절
+    if pos.hold_hours() >= 48 and pos.net_pnl() < -pos.entry_fees * 0.3:
         return True, "STOP_LOSS_TIME"
 
     return False, ""
@@ -582,19 +608,20 @@ def print_scan_results(opps: list):
             f"${o['xyz_vol_24h']/1e6:.0f}M",
             f"{o['total_ba_pct']:.3f}%",
             f"${entry_cost:.2f}",
+            f"{o.get('breakeven_h', 0):.1f}h",
         ])
-    headers = ["Ticker", "Spread/8h", "Annual", "XYZ/BN", "MinOI", "Vol24h", "BA%", "Cost$2K"]
+    headers = ["Ticker", "Spread/8h", "Annual", "XYZ/BN", "MinOI", "Vol24h", "BA%", "Cost$2K", "BEven"]
     print(tabulate(rows, headers=headers, tablefmt="simple_grid", stralign="right"))
 
 
 def main():
     args = sys.argv[1:]
     capital = 10000.0
-    max_pos = 3
+    max_pos = 2
     leverage = DEFAULT_LEVERAGE
-    min_spread = 0.04       # 0.04%/8h
+    min_spread = 0.10       # 0.10%/8h (이전 0.04 → 비용 대비 충분한 스프레드만)
     min_oi = 0.8             # 최소 OI $800K
-    pos_size_pct = 0.20      # 마진의 20%씩
+    pos_size_pct = 0.30      # 마진의 30%씩 (집중 투자)
 
     i = 0
     while i < len(args):
@@ -625,7 +652,8 @@ def main():
     print(f"  Capital: ${acct.capital:,.2f} | Leverage: {leverage}x | Max positions: {max_pos}")
     print(f"  Min spread: {min_spread}%/8h | Min OI: ${min_oi}M")
     print(f"  Margin per pos: {pos_size_pct*100:.0f}% of avail → notional ×{leverage}")
-    print(f"  Fees: XYZ {XYZ_TAKER_FEE*100:.3f}% + BN {BN_TAKER_FEE*100:.3f}% | Slip safety: {SLIPPAGE_SAFETY}x")
+    print(f"  Fees: XYZ {XYZ_TAKER_FEE*100:.3f}% + BN {BN_TAKER_FEE*100:.3f}% | Slip safety: {SLIPPAGE_SAFETY}x | BA limit: {LIMIT_ORDER_BA_FACTOR}x")
+    print(f"  Max BA: {MAX_BA_PCT*100:.2f}% | Max breakeven: {MAX_BREAKEVEN_HOURS}h | Min hold: {MIN_HOLD_HOURS}h")
 
     while True:
         iteration += 1
